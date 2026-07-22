@@ -290,7 +290,12 @@ extension TiBLECentralManagerProxy: CBCentralManagerDelegate {
         }
         var values = [String: Any]()
 
-        if let optionValue = values[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data] {
+        // NB: each of these reads from `advertisementData` (the real data CoreBluetooth passed
+        // in), not from `values` (the dict this function is itself building up) - a previous
+        // version of this code read from `values`, which is always empty at this point, so
+        // advertisementData was always reported as {} regardless of what the peripheral actually
+        // advertised.
+        if let optionValue = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data] {
             var adsData = [String: TiBuffer]()
             optionValue.forEach { (key, value) in
                 adsData[key.uuidString] = TiBLEUtils.toTiBuffer(from: value)._init(withPageContext: self.pageContext)
@@ -298,31 +303,31 @@ extension TiBLECentralManagerProxy: CBCentralManagerDelegate {
             values[CBAdvertisementDataServiceDataKey] = adsData
         }
 
-        if let optionValue = values[CBAdvertisementDataLocalNameKey] as? String {
+        if let optionValue = advertisementData[CBAdvertisementDataLocalNameKey] as? String {
             values[CBAdvertisementDataLocalNameKey] = optionValue
         }
 
-        if let optionValue = values[CBAdvertisementDataManufacturerDataKey] as? Data {
+        if let optionValue = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data {
             values[CBAdvertisementDataManufacturerDataKey] = TiBLEUtils.toTiBuffer(from: optionValue)._init(withPageContext: self.pageContext)
         }
 
-        if let optionValue = values[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] {
+        if let optionValue = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] {
             values[CBAdvertisementDataServiceUUIDsKey] = TiBLEUtils.toStringUUIDs(from: optionValue)
         }
 
-        if let optionValue = values[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID] {
+        if let optionValue = advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID] {
             values[CBAdvertisementDataOverflowServiceUUIDsKey] = TiBLEUtils.toStringUUIDs(from: optionValue)
         }
 
-        if let optionValue = values[CBAdvertisementDataTxPowerLevelKey] as? NSNumber {
+        if let optionValue = advertisementData[CBAdvertisementDataTxPowerLevelKey] as? NSNumber {
             values[CBAdvertisementDataTxPowerLevelKey] = optionValue
         }
 
-        if let optionValue = values[CBAdvertisementDataIsConnectable] as? NSNumber {
+        if let optionValue = advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber {
             values[CBAdvertisementDataIsConnectable] = optionValue
         }
 
-        if let optionValue = values[CBAdvertisementDataSolicitedServiceUUIDsKey] as? [CBUUID] {
+        if let optionValue = advertisementData[CBAdvertisementDataSolicitedServiceUUIDsKey] as? [CBUUID] {
             values[CBAdvertisementDataSolicitedServiceUUIDsKey] = TiBLEUtils.toStringUUIDs(from: optionValue)
         }
 

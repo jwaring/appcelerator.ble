@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.os.Build;
 import android.util.Log;
+import java.util.List;
 
 public abstract class ScanManager
 {
@@ -48,9 +49,9 @@ public abstract class ScanManager
 		killScan();
 	}
 
-	public void onPeripheralFound(BluetoothDevice bluetoothDevice, int i, byte[] bytes)
+	public void onPeripheralFound(BluetoothDevice bluetoothDevice, int i, byte[] bytes, List<String> serviceUuids)
 	{
-		listener.onScanDeviceFound(bluetoothDevice, i, bytes);
+		listener.onScanDeviceFound(bluetoothDevice, i, bytes, serviceUuids);
 	}
 
 	public static ScanManager build(BluetoothAdapter btAdapter, IScanDeviceFoundListener listener)
@@ -69,6 +70,6 @@ public abstract class ScanManager
 	abstract protected void killScan();
 
 	public interface IScanDeviceFoundListener {
-		void onScanDeviceFound(BluetoothDevice bluetoothDevice, int i, byte[] bytes);
+		void onScanDeviceFound(BluetoothDevice bluetoothDevice, int i, byte[] bytes, List<String> serviceUuids);
 	}
 }

@@ -92,7 +92,14 @@ public class ScanManagerAPI21Onwards extends ScanManager
 		public void onScanResult(int callbackType, ScanResult result)
 		{
 			super.onScanResult(callbackType, result);
-			onPeripheralFound(result.getDevice(), result.getRssi(), result.getScanRecord().getBytes());
+			List<String> serviceUuids = null;
+			if (result.getScanRecord() != null && result.getScanRecord().getServiceUuids() != null) {
+				serviceUuids = new ArrayList<>();
+				for (ParcelUuid parcelUuid : result.getScanRecord().getServiceUuids()) {
+					serviceUuids.add(parcelUuid.getUuid().toString());
+				}
+			}
+			onPeripheralFound(result.getDevice(), result.getRssi(), result.getScanRecord().getBytes(), serviceUuids);
 		}
 	};
 }

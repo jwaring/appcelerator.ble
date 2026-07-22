@@ -43,7 +43,10 @@ public class ScanManager19Onwards extends ScanManager implements BluetoothAdapte
 	@Override
 	public void onLeScan(BluetoothDevice bluetoothDevice, int i, byte[] bytes)
 	{
-		onPeripheralFound(bluetoothDevice, i, bytes);
+		// Pre-Lollipop legacy scan path has no ScanRecord API to extract parsed service UUIDs
+		// from - callers must fail open (treat null the same as "couldn't classify") rather than
+		// hiding every device on these very old devices.
+		onPeripheralFound(bluetoothDevice, i, bytes, null);
 	}
 
 	@Override

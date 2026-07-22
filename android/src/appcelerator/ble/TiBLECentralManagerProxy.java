@@ -26,6 +26,7 @@ import appcelerator.ble.scan.ScanManager;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import org.appcelerator.kroll.KrollDict;
 import org.appcelerator.kroll.KrollFunction;
 import org.appcelerator.kroll.KrollObject;
@@ -388,7 +389,7 @@ public class TiBLECentralManagerProxy extends KrollProxy
 			}
 		};
 
-	private ScanManager.IScanDeviceFoundListener scanListener = (bluetoothDevice, i, bytes) ->
+	private ScanManager.IScanDeviceFoundListener scanListener = (bluetoothDevice, i, bytes, serviceUuids) ->
 	{
 
 		TiBLEPeripheralProxy peripheralProxy =
@@ -402,6 +403,10 @@ public class TiBLECentralManagerProxy extends KrollProxy
 		BufferProxy bufferProxy = new BufferProxy();
 		bufferProxy.write(0, bytes, 0, bytes.length);
 		dict.put(KeysConstants.rawAdvertisementData.name(), bufferProxy);
+
+		if (serviceUuids != null) {
+			dict.put(KeysConstants.serviceUUIDs.name(), serviceUuids.toArray(new String[0]));
+		}
 
 		fireEvent(KeysConstants.didDiscoverPeripheral.name(), dict);
 	};
