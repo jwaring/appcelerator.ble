@@ -34,6 +34,22 @@ public class TiBleCentralOperationManager
 	private BluetoothGatt bluetoothGatt;
 	private ConnectionState connectionState = ConnectionState.New;
 
+	// Android's BluetoothGatt only permits one outstanding GATT operation (read/write
+	// characteristic, read/write descriptor, discoverServices, readRemoteRssi) at a time on a
+	// given connection - issuing a second one before the first's own BluetoothGattCallback method
+	// has fired silently drops or corrupts whichever one wasn't actually in progress. Confirmed as
+	// the root cause of a generic-ble notify subscription (subscribeToCharacteristic's
+	// writeDescriptor call) being silently dropped by a characteristic write issued ~500ms later,
+	// before the subscribe had actually completed - the write (issued last) succeeded, the earlier
+	// subscribe never did, and no data ever arrived. Every method below that touches bluetoothGatt
+	// is queued through enqueueGattOperation/completeGattOperation instead of calling it directly.
+	// Guarded by gattQueueLock, not just a plain field - enqueueGattOperation runs on the Kroll/JS
+	// thread, completeGattOperation runs from BluetoothGattCallback methods on Android's own
+	// Binder thread pool, genuinely concurrent with each other.
+	private final Object gattQueueLock = new Object();
+	private final java.util.Queue<Runnable> gattOperationQueue = new java.util.LinkedList<>();
+	private boolean gattOperationInProgress = false;
+
 	public TiBleCentralOperationManager(Context context, TiBLECentralManagerProxy centralManagerProxy,
 										TiBLEPeripheralProxy peripheralProxy, boolean autoConnect)
 	{
@@ -41,6 +57,49 @@ public class TiBleCentralOperationManager
 		this.centralManagerProxy = centralManagerProxy;
 		this.peripheralProxy = peripheralProxy;
 		this.autoConnect = autoConnect;
+	}
+
+	// Queues `operation` behind anything already in flight on this connection's BluetoothGatt, or
+	// runs it immediately if nothing is. `operation` must call completeGattOperation() exactly
+	// once - synchronously, if it determines up front that no BluetoothGattCallback method will
+	// ever fire for it (e.g. a bluetoothGatt.writeCharacteristic() call returning false), or from
+	// that eventual callback otherwise.
+	private void enqueueGattOperation(Runnable operation)
+	{
+		boolean runNow;
+		synchronized (gattQueueLock) {
+			gattOperationQueue.add(operation);
+			runNow = !gattOperationInProgress;
+			gattOperationInProgress = true;
+		}
+		if (runNow) {
+			operation.run();
+		}
+	}
+
+	// Called exactly once per queued operation, from wherever that operation's outcome becomes
+	// known - starts the next queued operation, if any.
+	private void completeGattOperation()
+	{
+		Runnable next;
+		synchronized (gattQueueLock) {
+			gattOperationQueue.poll();
+			next = gattOperationQueue.peek();
+			gattOperationInProgress = (next != null);
+		}
+		if (next != null) {
+			next.run();
+		}
+	}
+
+	// A disconnected connection's BluetoothGatt won't fire any more callbacks - anything still
+	// queued would otherwise stall forever (and would be stale/pointless to run regardless).
+	private void clearGattOperationQueue()
+	{
+		synchronized (gattQueueLock) {
+			gattOperationQueue.clear();
+			gattOperationInProgress = false;
+		}
 	}
 
 	public void initiateConnectionWithPeripheral()
@@ -58,6 +117,7 @@ public class TiBleCentralOperationManager
 			{
 				super.onReadRemoteRssi(gatt, rssi, status);
 				handleOnReadRemoteRssi(rssi, status);
+				completeGattOperation();
 			}
 
 			@Override
@@ -65,6 +125,7 @@ public class TiBleCentralOperationManager
 			{
 				super.onServicesDiscovered(gatt, status);
 				handleOnServicesDiscovered(gatt, status);
+				completeGattOperation();
 			}
 
 			@Override
@@ -72,12 +133,17 @@ public class TiBleCentralOperationManager
 			{
 				super.onCharacteristicRead(gatt, characteristic, status);
 				handleOnCharacteristicRead(characteristic, status);
+				completeGattOperation();
 			}
 
 			@Override
 			public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic)
 			{
 				super.onCharacteristicChanged(gatt, characteristic);
+				// An unsolicited notify/indicate push from the peripheral, not a response to our
+				// own readValueForCharacteristic() call - never queued via enqueueGattOperation,
+				// so must NOT call completeGattOperation() (that would advance the queue based on
+				// an event unrelated to whatever operation is actually in flight).
 				handleOnCharacteristicRead(characteristic, BluetoothGatt.GATT_SUCCESS);
 			}
 
@@ -87,6 +153,7 @@ public class TiBleCentralOperationManager
 			{
 				super.onCharacteristicWrite(gatt, characteristic, status);
 				handleOnCharacteristicWrite(characteristic, status);
+				completeGattOperation();
 			}
 
 			@Override
@@ -94,6 +161,7 @@ public class TiBleCentralOperationManager
 			{
 				super.onDescriptorRead(gatt, descriptor, status);
 				handleOnDescriptorRead(descriptor, status);
+				completeGattOperation();
 			}
 
 			@Override
@@ -101,7 +169,9 @@ public class TiBleCentralOperationManager
 			{
 				super.onDescriptorWrite(gatt, descriptor, status);
 				handleOnDescriptorWrite(descriptor, status);
+				completeGattOperation();
 			}
+
 		});
 		connectionState = ConnectionState.Connecting;
 	}
@@ -253,7 +323,15 @@ public class TiBleCentralOperationManager
 
 	public void readRSSI()
 	{
-		bluetoothGatt.readRemoteRssi();
+		enqueueGattOperation(() -> {
+			boolean isReadInitiated = bluetoothGatt.readRemoteRssi();
+			if (!isReadInitiated) {
+				// No previous behaviour to preserve here (readRemoteRssi()'s return value was
+				// never checked before) - just unblock the queue, since onReadRemoteRssi will
+				// never fire for this call.
+				completeGattOperation();
+			}
+		});
 	}
 
 	public void requestConnectionPriority(int priority)
@@ -269,7 +347,15 @@ public class TiBleCentralOperationManager
 
 	public void discoverServices()
 	{
-		bluetoothGatt.discoverServices();
+		enqueueGattOperation(() -> {
+			boolean isDiscoveryInitiated = bluetoothGatt.discoverServices();
+			if (!isDiscoveryInitiated) {
+				// No previous behaviour to preserve here (discoverServices()'s return value was
+				// never checked before) - just unblock the queue, since onServicesDiscovered will
+				// never fire for this call.
+				completeGattOperation();
+			}
+		});
 	}
 
 	public void discoverIncludedServices(TiBLEServiceProxy serviceProxy)
@@ -328,191 +414,232 @@ public class TiBleCentralOperationManager
 		}
 
 		bluetoothGatt.close();
+		clearGattOperationQueue();
 		centralManagerProxy.stopAndUnbindService();
 	}
 
 	public void readValueForCharacteristic(TiBLECharacteristicProxy characteristicProxy)
 	{
-		boolean isReadInitiated = bluetoothGatt.readCharacteristic(characteristicProxy.getCharacteristic());
-		Log.d(LCAT, "readValueForCharacteristic(): characteristic- " + characteristicProxy.uuid()
-						+ " read initiation status- ." + isReadInitiated);
-		if (!isReadInitiated) {
-			KrollDict dict = new KrollDict();
-			String errorMessage = "failed to initiate reading characteristic for peripheral name/address- "
-								  + peripheralProxy.name() + " / " + peripheralProxy.address();
-			dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
-			dict.put(KeysConstants.characteristic.name(), characteristicProxy);
-			dict.put(KeysConstants.errorCode.name(), BluetoothGatt.GATT_FAILURE);
-			dict.put(KeysConstants.errorDescription.name(),
-					 getErrorDescriptionMessage(BluetoothGatt.GATT_FAILURE, errorMessage));
-			peripheralProxy.fireEvent(KeysConstants.didUpdateValueForCharacteristic.name(), dict);
-		}
+		enqueueGattOperation(() -> {
+			boolean isReadInitiated = bluetoothGatt.readCharacteristic(characteristicProxy.getCharacteristic());
+			Log.d(LCAT, "readValueForCharacteristic(): characteristic- " + characteristicProxy.uuid()
+							+ " read initiation status- ." + isReadInitiated);
+			if (!isReadInitiated) {
+				KrollDict dict = new KrollDict();
+				String errorMessage = "failed to initiate reading characteristic for peripheral name/address- "
+									  + peripheralProxy.name() + " / " + peripheralProxy.address();
+				dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
+				dict.put(KeysConstants.characteristic.name(), characteristicProxy);
+				dict.put(KeysConstants.errorCode.name(), BluetoothGatt.GATT_FAILURE);
+				dict.put(KeysConstants.errorDescription.name(),
+						 getErrorDescriptionMessage(BluetoothGatt.GATT_FAILURE, errorMessage));
+				peripheralProxy.fireEvent(KeysConstants.didUpdateValueForCharacteristic.name(), dict);
+				// onCharacteristicRead will never fire for this call - unblock the queue here.
+				completeGattOperation();
+			}
+		});
 	}
 
 	public void writeValueForCharacteristic(TiBLECharacteristicProxy charProxy, byte[] buffer, int writeType)
 	{
-		charProxy.getCharacteristic().setWriteType(writeType);
-		charProxy.getCharacteristic().setValue(buffer);
-		boolean isWritingInitiated = bluetoothGatt.writeCharacteristic(charProxy.getCharacteristic());
-		Log.d(LCAT, "writeValueForCharacteristic(): characteristic- " + charProxy.uuid() + " write initiation status- ."
-						+ isWritingInitiated);
-		if (!isWritingInitiated) {
-			KrollDict dict = new KrollDict();
-			String errorMessage = "failed to initiate writing value on characteristic for peripheral name/address- "
-								  + peripheralProxy.name() + " / " + peripheralProxy.address();
-			dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
-			dict.put(KeysConstants.characteristic.name(), charProxy);
-			dict.put(KeysConstants.errorCode.name(), BluetoothGatt.GATT_FAILURE);
-			dict.put(KeysConstants.errorDescription.name(),
-					 getErrorDescriptionMessage(BluetoothGatt.GATT_FAILURE, errorMessage));
-			peripheralProxy.fireEvent(KeysConstants.didWriteValueForCharacteristic.name(), dict);
-		}
+		enqueueGattOperation(() -> {
+			charProxy.getCharacteristic().setWriteType(writeType);
+			charProxy.getCharacteristic().setValue(buffer);
+			boolean isWritingInitiated = bluetoothGatt.writeCharacteristic(charProxy.getCharacteristic());
+			Log.d(LCAT, "writeValueForCharacteristic(): characteristic- " + charProxy.uuid() + " write initiation status- ."
+							+ isWritingInitiated);
+			if (!isWritingInitiated) {
+				KrollDict dict = new KrollDict();
+				String errorMessage = "failed to initiate writing value on characteristic for peripheral name/address- "
+									  + peripheralProxy.name() + " / " + peripheralProxy.address();
+				dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
+				dict.put(KeysConstants.characteristic.name(), charProxy);
+				dict.put(KeysConstants.errorCode.name(), BluetoothGatt.GATT_FAILURE);
+				dict.put(KeysConstants.errorDescription.name(),
+						 getErrorDescriptionMessage(BluetoothGatt.GATT_FAILURE, errorMessage));
+				peripheralProxy.fireEvent(KeysConstants.didWriteValueForCharacteristic.name(), dict);
+				// onCharacteristicWrite will never fire for this call - unblock the queue here.
+				completeGattOperation();
+			}
+		});
 	}
 
 	public void readValueForDescriptor(TiBLEDescriptorProxy descriptorProxy)
 	{
-		boolean isReadInitiated = bluetoothGatt.readDescriptor(descriptorProxy.getDescriptor());
-		Log.d(LCAT, "readValueForDescriptor(): descriptor- " + descriptorProxy.uuid() + " read initiation status- ."
-						+ isReadInitiated);
-		if (!isReadInitiated) {
-			KrollDict dict = new KrollDict();
-			String errorMessage = "failed to initiate reading value on descriptor for peripheral name/address- "
-								  + peripheralProxy.name() + " / " + peripheralProxy.address();
-			dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
-			dict.put(KeysConstants.descriptor.name(), descriptorProxy);
-			dict.put(KeysConstants.errorCode.name(), BluetoothGatt.GATT_FAILURE);
-			dict.put(KeysConstants.errorDescription.name(),
-					 getErrorDescriptionMessage(BluetoothGatt.GATT_FAILURE, errorMessage));
-			peripheralProxy.fireEvent(KeysConstants.didUpdateValueForDescriptor.name(), dict);
-		}
+		enqueueGattOperation(() -> {
+			boolean isReadInitiated = bluetoothGatt.readDescriptor(descriptorProxy.getDescriptor());
+			Log.d(LCAT, "readValueForDescriptor(): descriptor- " + descriptorProxy.uuid() + " read initiation status- ."
+							+ isReadInitiated);
+			if (!isReadInitiated) {
+				KrollDict dict = new KrollDict();
+				String errorMessage = "failed to initiate reading value on descriptor for peripheral name/address- "
+									  + peripheralProxy.name() + " / " + peripheralProxy.address();
+				dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
+				dict.put(KeysConstants.descriptor.name(), descriptorProxy);
+				dict.put(KeysConstants.errorCode.name(), BluetoothGatt.GATT_FAILURE);
+				dict.put(KeysConstants.errorDescription.name(),
+						 getErrorDescriptionMessage(BluetoothGatt.GATT_FAILURE, errorMessage));
+				peripheralProxy.fireEvent(KeysConstants.didUpdateValueForDescriptor.name(), dict);
+				// onDescriptorRead will never fire for this call - unblock the queue here.
+				completeGattOperation();
+			}
+		});
 	}
 
 	public void writeValueForDescriptor(TiBLEDescriptorProxy descriptorProxy, byte[] buffer)
 	{
-		BluetoothGattDescriptor descriptor = descriptorProxy.getDescriptor();
-		descriptor.setValue(buffer);
-		boolean isWritingInitiated = bluetoothGatt.writeDescriptor(descriptor);
-		Log.d(LCAT, "writeValueForDescriptor(): descriptor- " + descriptorProxy.uuid() + " write initiation status- ."
-						+ isWritingInitiated);
-		if (!isWritingInitiated) {
-			KrollDict dict = new KrollDict();
-			String errorMessage = "failed to initiate writing value on descriptor for peripheral name/address- "
-								  + peripheralProxy.name() + " / " + peripheralProxy.address();
-			dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
-			dict.put(KeysConstants.descriptor.name(), descriptorProxy);
-			dict.put(KeysConstants.errorCode.name(), BluetoothGatt.GATT_FAILURE);
-			dict.put(KeysConstants.errorDescription.name(),
-					 getErrorDescriptionMessage(BluetoothGatt.GATT_FAILURE, errorMessage));
-			peripheralProxy.fireEvent(KeysConstants.didWriteValueForDescriptor.name(), dict);
-		}
+		enqueueGattOperation(() -> {
+			BluetoothGattDescriptor descriptor = descriptorProxy.getDescriptor();
+			descriptor.setValue(buffer);
+			boolean isWritingInitiated = bluetoothGatt.writeDescriptor(descriptor);
+			Log.d(LCAT, "writeValueForDescriptor(): descriptor- " + descriptorProxy.uuid() + " write initiation status- ."
+							+ isWritingInitiated);
+			if (!isWritingInitiated) {
+				KrollDict dict = new KrollDict();
+				String errorMessage = "failed to initiate writing value on descriptor for peripheral name/address- "
+									  + peripheralProxy.name() + " / " + peripheralProxy.address();
+				dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
+				dict.put(KeysConstants.descriptor.name(), descriptorProxy);
+				dict.put(KeysConstants.errorCode.name(), BluetoothGatt.GATT_FAILURE);
+				dict.put(KeysConstants.errorDescription.name(),
+						 getErrorDescriptionMessage(BluetoothGatt.GATT_FAILURE, errorMessage));
+				peripheralProxy.fireEvent(KeysConstants.didWriteValueForDescriptor.name(), dict);
+				// onDescriptorWrite will never fire for this call - unblock the queue here.
+				completeGattOperation();
+			}
+		});
 	}
 
 	public void subscribeToCharacteristic(TiBLECharacteristicProxy charProxy, String descriptorUUID,
 										  BufferProxy enableValue)
 	{
-		int properties = charProxy.getCharacteristic().getProperties();
-		if ((properties & PROPERTY_NOTIFY) <= 0 && (properties & PROPERTY_INDICATE) <= 0) {
-			String errorDescription = String.format(
-				"cannot subscribe as characteristic- %s does not have notify/indicate property.", charProxy.uuid());
-			Log.e(LCAT, "subscribeToCharacteristic(): " + errorDescription);
-			fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, true);
-			return;
-		}
-
-		String descUuid = descriptorUUID != null && !descriptorUUID.isEmpty()
-							  ? descriptorUUID
-							  : UUID_CLIENT_CHARACTERISTIC_CONFIGURATION;
-		if (charProxy.getCharacteristic().getDescriptor(UUID.fromString(descUuid)) == null) {
-			String errorDescription = String.format("cannot subscribe as CCC descriptor- %s not found", descUuid);
-			Log.e(LCAT, "subscribeToCharacteristic(): " + errorDescription);
-			fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, true);
-			return;
-		}
-
-		boolean setCharNotificationSuccessful =
-			bluetoothGatt.setCharacteristicNotification(charProxy.getCharacteristic(), true);
-		if (!setCharNotificationSuccessful) {
-			String errorDescription = String.format(
-				"cannot subscribe as setCharacteristicNotification for characteristic- %s failed.", charProxy.uuid());
-			Log.e(LCAT, "subscribeToCharacteristic(): " + errorDescription);
-			fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, true);
-			return;
-		}
-
-		if (descriptorUUID != null && !descriptorUUID.isEmpty()) {
-			BluetoothGattDescriptor descriptor =
-				charProxy.getCharacteristic().getDescriptor(UUID.fromString(descriptorUUID));
-			descriptor.setValue(enableValue.getBuffer());
-			boolean isWrite = bluetoothGatt.writeDescriptor(descriptor);
-			if (!isWrite) {
-				String errorDescription =
-					String.format("cannot subscribe as writeDescriptor failed for descriptor- %s .", descriptorUUID);
+		enqueueGattOperation(() -> {
+			int properties = charProxy.getCharacteristic().getProperties();
+			if ((properties & PROPERTY_NOTIFY) <= 0 && (properties & PROPERTY_INDICATE) <= 0) {
+				String errorDescription = String.format(
+					"cannot subscribe as characteristic- %s does not have notify/indicate property.", charProxy.uuid());
 				Log.e(LCAT, "subscribeToCharacteristic(): " + errorDescription);
 				fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, true);
+				completeGattOperation();
 				return;
 			}
-		}
-		Log.d(LCAT, "subscribeToCharacteristic(): subscribe successful");
 
-		KrollDict dict = new KrollDict();
-		dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
-		dict.put(KeysConstants.characteristic.name(), charProxy);
-		dict.put(KeysConstants.isSubscribed.name(), true);
-		peripheralProxy.fireEvent(KeysConstants.didUpdateNotificationStateForCharacteristics.name(), dict);
+			String descUuid = descriptorUUID != null && !descriptorUUID.isEmpty()
+								  ? descriptorUUID
+								  : UUID_CLIENT_CHARACTERISTIC_CONFIGURATION;
+			if (charProxy.getCharacteristic().getDescriptor(UUID.fromString(descUuid)) == null) {
+				String errorDescription = String.format("cannot subscribe as CCC descriptor- %s not found", descUuid);
+				Log.e(LCAT, "subscribeToCharacteristic(): " + errorDescription);
+				fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, true);
+				completeGattOperation();
+				return;
+			}
+
+			boolean setCharNotificationSuccessful =
+				bluetoothGatt.setCharacteristicNotification(charProxy.getCharacteristic(), true);
+			if (!setCharNotificationSuccessful) {
+				String errorDescription = String.format(
+					"cannot subscribe as setCharacteristicNotification for characteristic- %s failed.", charProxy.uuid());
+				Log.e(LCAT, "subscribeToCharacteristic(): " + errorDescription);
+				fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, true);
+				completeGattOperation();
+				return;
+			}
+
+			// Only this branch (a real writeDescriptor() call) leaves an async GATT operation in
+			// flight - onDescriptorWrite completes the queue for it. Every other path here
+			// (the three early returns above, and falling through to the success event below
+			// when no descriptorUUID was given at all) resolves synchronously and must complete
+			// the queue itself, since no BluetoothGattCallback method will ever follow for it.
+			if (descriptorUUID != null && !descriptorUUID.isEmpty()) {
+				BluetoothGattDescriptor descriptor =
+					charProxy.getCharacteristic().getDescriptor(UUID.fromString(descriptorUUID));
+				descriptor.setValue(enableValue.getBuffer());
+				boolean isWrite = bluetoothGatt.writeDescriptor(descriptor);
+				if (!isWrite) {
+					String errorDescription = String.format(
+						"cannot subscribe as writeDescriptor failed for descriptor- %s .", descriptorUUID);
+					Log.e(LCAT, "subscribeToCharacteristic(): " + errorDescription);
+					fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, true);
+					completeGattOperation();
+					return;
+				}
+				Log.d(LCAT, "subscribeToCharacteristic(): subscribe successful");
+				return;
+			}
+			Log.d(LCAT, "subscribeToCharacteristic(): subscribe successful");
+
+			KrollDict dict = new KrollDict();
+			dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
+			dict.put(KeysConstants.characteristic.name(), charProxy);
+			dict.put(KeysConstants.isSubscribed.name(), true);
+			peripheralProxy.fireEvent(KeysConstants.didUpdateNotificationStateForCharacteristics.name(), dict);
+			completeGattOperation();
+		});
 	}
 
 	public void unsubscribeFromCharacteristic(TiBLECharacteristicProxy charProxy, String descriptorUUID,
 											  BufferProxy disableValue)
 	{
-		int properties = charProxy.getCharacteristic().getProperties();
-		if ((properties & PROPERTY_NOTIFY) <= 0 && (properties & PROPERTY_INDICATE) <= 0) {
-			String errorDescription = String.format(
-				"cannot unsubscribe as Characteristic- %s does not have notify or indicate property", charProxy.uuid());
-			Log.e(LCAT, "unsubscribeFromCharacteristic(): " + errorDescription);
-			fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, false);
-			return;
-		}
-
-		String descUuid = descriptorUUID != null && !descriptorUUID.isEmpty()
-							  ? descriptorUUID
-							  : UUID_CLIENT_CHARACTERISTIC_CONFIGURATION;
-		if (charProxy.getCharacteristic().getDescriptor(UUID.fromString(descUuid)) == null) {
-			String errorDescription = String.format("cannot unsubscribe as CCC descriptor- %s not found", descUuid);
-			Log.e(LCAT, "unsubscribeFromCharacteristic(): " + errorDescription);
-			fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, false);
-			return;
-		}
-
-		boolean setCharNotificationSuccessful =
-			bluetoothGatt.setCharacteristicNotification(charProxy.getCharacteristic(), false);
-		if (!setCharNotificationSuccessful) {
-			String errorDescription = String.format(
-				"cannot unsubscribe as setCharacteristicNotification for characteristic- %s failed.", charProxy.uuid());
-			Log.e(LCAT, "unsubscribeFromCharacteristic(): " + errorDescription);
-			fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, false);
-			return;
-		}
-
-		if (descriptorUUID != null && !descriptorUUID.isEmpty()) {
-			BluetoothGattDescriptor descriptor =
-				charProxy.getCharacteristic().getDescriptor(UUID.fromString(descriptorUUID));
-			descriptor.setValue(disableValue.getBuffer());
-			boolean isWrite = bluetoothGatt.writeDescriptor(descriptor);
-			if (!isWrite) {
-				String errorDescription =
-					String.format("cannot unsubscribe as writeDescriptor failed for descriptor- %s .", descriptorUUID);
+		enqueueGattOperation(() -> {
+			int properties = charProxy.getCharacteristic().getProperties();
+			if ((properties & PROPERTY_NOTIFY) <= 0 && (properties & PROPERTY_INDICATE) <= 0) {
+				String errorDescription = String.format(
+					"cannot unsubscribe as Characteristic- %s does not have notify or indicate property", charProxy.uuid());
 				Log.e(LCAT, "unsubscribeFromCharacteristic(): " + errorDescription);
 				fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, false);
+				completeGattOperation();
 				return;
 			}
-		}
-		Log.d(LCAT, "unsubscribeToCharacteristic(): unsubscribe successful");
 
-		KrollDict dict = new KrollDict();
-		dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
-		dict.put(KeysConstants.characteristic.name(), charProxy);
-		dict.put(KeysConstants.isSubscribed.name(), false);
-		peripheralProxy.fireEvent(KeysConstants.didUpdateNotificationStateForCharacteristics.name(), dict);
+			String descUuid = descriptorUUID != null && !descriptorUUID.isEmpty()
+								  ? descriptorUUID
+								  : UUID_CLIENT_CHARACTERISTIC_CONFIGURATION;
+			if (charProxy.getCharacteristic().getDescriptor(UUID.fromString(descUuid)) == null) {
+				String errorDescription = String.format("cannot unsubscribe as CCC descriptor- %s not found", descUuid);
+				Log.e(LCAT, "unsubscribeFromCharacteristic(): " + errorDescription);
+				fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, false);
+				completeGattOperation();
+				return;
+			}
+
+			boolean setCharNotificationSuccessful =
+				bluetoothGatt.setCharacteristicNotification(charProxy.getCharacteristic(), false);
+			if (!setCharNotificationSuccessful) {
+				String errorDescription = String.format(
+					"cannot unsubscribe as setCharacteristicNotification for characteristic- %s failed.", charProxy.uuid());
+				Log.e(LCAT, "unsubscribeFromCharacteristic(): " + errorDescription);
+				fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, false);
+				completeGattOperation();
+				return;
+			}
+
+			// See subscribeToCharacteristic()'s identical comment above.
+			if (descriptorUUID != null && !descriptorUUID.isEmpty()) {
+				BluetoothGattDescriptor descriptor =
+					charProxy.getCharacteristic().getDescriptor(UUID.fromString(descriptorUUID));
+				descriptor.setValue(disableValue.getBuffer());
+				boolean isWrite = bluetoothGatt.writeDescriptor(descriptor);
+				if (!isWrite) {
+					String errorDescription = String.format(
+						"cannot unsubscribe as writeDescriptor failed for descriptor- %s .", descriptorUUID);
+					Log.e(LCAT, "unsubscribeFromCharacteristic(): " + errorDescription);
+					fireFailedUpdateNotificationStateEvent(charProxy, errorDescription, false);
+					completeGattOperation();
+					return;
+				}
+				Log.d(LCAT, "unsubscribeToCharacteristic(): unsubscribe successful");
+				return;
+			}
+			Log.d(LCAT, "unsubscribeToCharacteristic(): unsubscribe successful");
+
+			KrollDict dict = new KrollDict();
+			dict.put(KeysConstants.sourcePeripheral.name(), peripheralProxy);
+			dict.put(KeysConstants.characteristic.name(), charProxy);
+			dict.put(KeysConstants.isSubscribed.name(), false);
+			peripheralProxy.fireEvent(KeysConstants.didUpdateNotificationStateForCharacteristics.name(), dict);
+			completeGattOperation();
+		});
 	}
 
 	private void fireFailedUpdateNotificationStateEvent(TiBLECharacteristicProxy charProxy, String errorDescription,
